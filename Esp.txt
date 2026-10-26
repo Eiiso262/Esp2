@@ -1,0 +1,1503 @@
+--[[
+╔═══════════════════════════════════════════════════════════╗
+║          NPC / BOT ESP  v3.4  ·  Stable + Easy Menu        ║
+║      LocalScript  →  StarterGui   (PC & Mobile)           ║
+╠═══════════════════════════════════════════════════════════╣
+║  PC     : [F] เมนู  │  [E] เปิด/ปิด ESP                   ║
+║  Mobile : ปุ่ม ESP (ซ้าย)  │  ปุ่ม ☰ (ขวา)                ║
+╠═══════════════════════════════════════════════════════════╣
+║  v3.4                                                     ║
+║  • แก้ Box และเพิ่ม fallback สำหรับริกที่ไม่มาตรฐาน         ║
+║  • HP: % / ปัจจุบัน / ปัจจุบัน+สูงสุด / แบบรวม             ║
+║  • ลูปสแกนและเรนเดอร์ไม่หยุดถาวรเมื่อมี error              ║
+║  • ล้าง Drawing ที่ไม่ใช้และทำความสะอาดเมื่อรันสคริปต์ซ้ำ  ║
+║  • เมนูใหม่ ลากด้วยแถบหัว รองรับเมาส์และทัชสกรีน           ║
+╚═══════════════════════════════════════════════════════════╝
+--]]
+
+local Players          = game:GetService("Players")
+local RunService       = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService     = game:GetService("TweenService")
+local LocalPlayer      = Players.LocalPlayer
+local PlayerGui        = LocalPlayer:WaitForChild("PlayerGui")
+
+-- รันซ้ำได้โดยไม่สะสม event / Drawing จากรอบก่อน
+local SCRIPT_KEY = "__NPC_BOT_ESP_V34_SINGLE_INSTANCE__"
+local Shared = _G
+pcall(function()
+    if type(getgenv) == "function" then
+        local env = getgenv()
+        if type(env) == "table" then Shared = env end
+    end
+end)
+
+local oldRuntime = Shared[SCRIPT_KEY]
+if oldRuntime and type(oldRuntime.Destroy) == "function" then
+    pcall(oldRuntime.Destroy)
+end
+
+local Runtime = {
+    Alive = true,
+    Connections = {},
+    PlayerConnections = {},
+    GUI = nil,
+    LastScanWarn = 0,
+    LastRenderWarn = 0,
+}
+Shared[SCRIPT_KEY] = Runtime
+
+local function Connect(signal, callback)
+    local conn = signal:Connect(callback)
+    table.insert(Runtime.Connections, conn)
+    return conn
+end
+
+-- เดิมเก็บ Camera ครั้งเดียว → ถ้าเกมสลับกล้อง พิกัดจะผิดทั้งหมด
+local Camera = workspace.CurrentCamera
+while not Camera do
+    task.wait()
+    Camera = workspace.CurrentCamera
+end
+Connect(workspace:GetPropertyChangedSignal("CurrentCamera"), function()
+    Camera = workspace.CurrentCamera or Camera
+end)
+
+local isMobile = UserInputService.TouchEnabled
+             and not UserInputService.KeyboardEnabled
+
+local CFG = {
+    ESP_Enabled   = true,
+    ShowBox       = true,
+    ShowSkeleton  = true,
+    ShowHPBar     = true,
+    ShowHPText    = true,
+    HPTextMode    = "Both", -- Percent / Current / Number / Both
+    ShowName      = true,
+    ShowDist      = true,
+    ShowTracer    = true,
+
+    HideDead       = true,   -- ซ่อน NPC ที่ Health <= 0
+    RescanInterval = 6,      -- วินาที: สแกนสำรองหา NPC ที่หลุด (0 = ปิด)
+    SlotIdleTime   = 30,     -- วินาที: ล้าง Drawing ของ NPC ที่ไม่ได้แสดงนานแล้ว
+    UpdateFPS      = 30,     -- จำกัดการคำนวณ ESP ไม่ให้หนักเกินจำเป็น
+    AlphaInverted  = false,  -- true = ตัวรันของคุณใช้ Transparency กลับด้าน (0 = มองเห็น)
+
+    MaxDist       = 500,
+    BoxThick      = 1.5,
+    SkelThick     = 1.0,
+    TracerThick   = 1.0,
+    NameSize      = 13,
+    DistSize      = 11,
+    HPTextSize    = 11,
+
+    Opacity       = 1.0,
+
+    BoxCol        = Color3.fromRGB(255, 55,  55),
+    SkelCol       = Color3.fromRGB(255, 180, 55),
+    HPHigh        = Color3.fromRGB(60,  220, 90),
+    HPMid         = Color3.fromRGB(255, 200, 0),
+    HPLow         = Color3.fromRGB(255, 55,  55),
+    HPBgCol       = Color3.fromRGB(20,  20,  20),
+    NameCol       = Color3.fromRGB(255, 255, 255),
+    DistCol       = Color3.fromRGB(190, 190, 190),
+    TracerCol     = Color3.fromRGB(255, 55,  55),
+
+    KeyMenu       = Enum.KeyCode.F,
+    KeyToggle     = Enum.KeyCode.E,
+
+    Filter        = {},
+}
+
+-- Drawing API มีเฉพาะในตัวรันสคริปต์ที่รองรับ (LocalScript ปกติของ Roblox ไม่มี)
+local hasDrawing = false
+pcall(function()
+    hasDrawing = typeof(Drawing) ~= "nil" and typeof(Drawing.new) == "function"
+end)
+if not hasDrawing then
+    warn("[ESP] ไม่พบ Drawing API — ESP จะไม่วาดอะไรเลย")
+end
+
+local huge  = math.huge
+local clamp = math.clamp
+local max   = math.max
+local floor = math.floor
+local sqrt  = math.sqrt
+local fmt   = string.format
+local v2new = Vector2.new
+local v3new = Vector3.new
+local c3new = Color3.new
+
+local function W2S(pos)
+    local s, vis = Camera:WorldToViewportPoint(pos)
+    return s.X, s.Y, vis, s.Z
+end
+
+local function LerpC3(r1,g1,b1, r2,g2,b2, t)
+    return c3new(r1+(r2-r1)*t, g1+(g2-g1)*t, b1+(b2-b1)*t)
+end
+
+local function HPColor(pct)
+    if pct >= 0.5 then
+        local t = (pct - 0.5) * 2
+        return LerpC3(
+            CFG.HPMid.R, CFG.HPMid.G, CFG.HPMid.B,
+            CFG.HPHigh.R,CFG.HPHigh.G,CFG.HPHigh.B, t)
+    else
+        local t = pct * 2
+        return LerpC3(
+            CFG.HPLow.R, CFG.HPLow.G, CFG.HPLow.B,
+            CFG.HPMid.R, CFG.HPMid.G, CFG.HPMid.B, t)
+    end
+end
+
+local function IsFiniteNumber(n)
+    return type(n) == "number" and n == n and n ~= huge and n ~= -huge
+end
+
+local function FormatHPNumber(n)
+    if not IsFiniteNumber(n) then return "?" end
+    if math.abs(n - floor(n + 0.5)) < 0.05 then
+        return fmt("%.0f", n)
+    end
+    return fmt("%.1f", n)
+end
+
+-- อ่าน Humanoid ก่อน; รองรับ Attribute สำหรับเกมที่ใช้ระบบเลือดเฉพาะเอง
+local function GetHealth(model, hum)
+    local hp, maxHP
+
+    if hum then
+        if IsFiniteNumber(hum.Health) then hp = hum.Health end
+        if IsFiniteNumber(hum.MaxHealth) then maxHP = hum.MaxHealth end
+    end
+
+    if hp == nil then
+        for _, key in ipairs({"Health", "HP"}) do
+            local value = model:GetAttribute(key)
+            if IsFiniteNumber(value) then
+                hp = value
+                break
+            end
+        end
+    end
+
+    if maxHP == nil then
+        for _, key in ipairs({"MaxHealth", "MaxHP"}) do
+            local value = model:GetAttribute(key)
+            if IsFiniteNumber(value) then
+                maxHP = value
+                break
+            end
+        end
+    end
+
+    if hp == nil then return nil, nil, nil end
+
+    hp = max(0, hp)
+    if maxHP ~= nil then maxHP = max(0, maxHP) end
+
+    local pct
+    if maxHP and maxHP > 0 then
+        pct = clamp(hp / maxHP, 0, 1)
+    else
+        pct = hp > 0 and 1 or 0
+    end
+    if not IsFiniteNumber(pct) then pct = 0 end
+
+    return hp, maxHP, pct
+end
+
+local function FormatHPText(hp, maxHP, pct)
+    local hpText = FormatHPNumber(hp)
+    local pctText = fmt("%.0f%%", pct * 100)
+    local mode = CFG.HPTextMode
+
+    if mode == "Percent" then
+        return "HP: " .. pctText
+    elseif mode == "Current" then
+        return "HP: " .. hpText
+    elseif mode == "Number" then
+        if maxHP and maxHP > 0 then
+            return fmt("HP: %s / %s", hpText, FormatHPNumber(maxHP))
+        end
+        return "HP: " .. hpText
+    end
+
+    if maxHP and maxHP > 0 then
+        return fmt("HP: %s / %s  |  %s", hpText, FormatHPNumber(maxHP), pctText)
+    end
+    return fmt("HP: %s  |  %s", hpText, pctText)
+end
+
+local function GetPlayerPos()
+    local c = LocalPlayer.Character
+    if c then
+        local h = c:FindFirstChild("HumanoidRootPart")
+        if h and h:IsA("BasePart") then return h.Position end
+    end
+    return Camera.CFrame.Position
+end
+
+-- ═════════════════════════════════════════════════════════
+--  Drawing slots (1 slot ต่อ 1 NPC)
+-- ═════════════════════════════════════════════════════════
+local pool = {}
+
+local SLOT_KEYS = {"b1","b2","b3","b4","hpBg","hpFg","nameT","distT","hpT","tracer"}
+local MAX_SKEL  = 15
+
+local ALPHA_MUL = {
+    b1 = 1, b2 = 1, b3 = 1, b4 = 1,
+    hpBg = 0.85, hpFg = 1,
+    nameT = 1, distT = 1, hpT = 1,
+    tracer = 0.6,
+}
+local SKEL_ALPHA = 0.75
+
+-- Drawing.Transparency: 1 = มองเห็นเต็มที่, 0 = มองไม่เห็น
+local function SetAlpha(d, a)
+    if d then
+        d.Transparency = CFG.AlphaInverted and (1 - a) or a
+    end
+end
+
+local FONT_UI = 0
+if hasDrawing then
+    pcall(function() FONT_UI = Drawing.Fonts.UI end)
+end
+
+local function NewLine(col, thick, alpha)
+    if not hasDrawing then return nil end
+    local l = Drawing.new("Line")
+    l.Visible   = false
+    l.Color     = col
+    l.Thickness = thick
+    SetAlpha(l, alpha or 1)
+    return l
+end
+
+local function NewRect(col, alpha, filled)
+    if not hasDrawing then return nil end
+    local q = Drawing.new("Square")
+    q.Visible   = false
+    q.Color     = col
+    q.Filled    = filled
+    q.Thickness = 1
+    SetAlpha(q, alpha or 1)
+    return q
+end
+
+local function NewText(col, sz, alpha)
+    if not hasDrawing then return nil end
+    local t = Drawing.new("Text")
+    t.Visible      = false
+    t.Color        = col
+    t.Size         = sz
+    t.Font         = FONT_UI
+    t.Outline      = true
+    t.OutlineColor = c3new(0, 0, 0)
+    t.Center       = true
+    SetAlpha(t, alpha or 1)
+    return t
+end
+
+local function RemoveDrawing(d)
+    if not d then return end
+    if not pcall(function() d:Remove() end) then
+        pcall(function() d:Destroy() end)
+    end
+end
+
+local function DestroySlot(s)
+    if not s then return end
+    for _, k in ipairs(SLOT_KEYS) do RemoveDrawing(s[k]) end
+    if s.sk then
+        for i = 1, MAX_SKEL do RemoveDrawing(s.sk[i]) end
+    end
+end
+
+local function HideSlot(s)
+    if not s then return end
+    for _, k in ipairs(SLOT_KEYS) do
+        local d = s[k]
+        if d then d.Visible = false end
+    end
+    if s.sk then
+        for i = 1, MAX_SKEL do
+            if s.sk[i] then s.sk[i].Visible = false end
+        end
+    end
+end
+
+-- ถ้าสร้าง Drawing ไม่สำเร็จกลางคัน ให้ลบของที่สร้างไปแล้ว ไม่ปล่อยรั่วทุกครั้งที่ retry
+local function CreateSlot()
+    local op = CFG.Opacity
+    local s = {sk = {}, LastActive = os.clock()}
+
+    local ok, err = pcall(function()
+        s.b1     = NewLine(CFG.BoxCol,    CFG.BoxThick,    op * ALPHA_MUL.b1)
+        s.b2     = NewLine(CFG.BoxCol,    CFG.BoxThick,    op * ALPHA_MUL.b2)
+        s.b3     = NewLine(CFG.BoxCol,    CFG.BoxThick,    op * ALPHA_MUL.b3)
+        s.b4     = NewLine(CFG.BoxCol,    CFG.BoxThick,    op * ALPHA_MUL.b4)
+        s.hpBg   = NewRect(CFG.HPBgCol,   op * ALPHA_MUL.hpBg, true)
+        s.hpFg   = NewRect(CFG.HPHigh,    op * ALPHA_MUL.hpFg, true)
+        s.nameT  = NewText(CFG.NameCol,   CFG.NameSize,    op * ALPHA_MUL.nameT)
+        s.distT  = NewText(CFG.DistCol,   CFG.DistSize,    op * ALPHA_MUL.distT)
+        s.hpT    = NewText(CFG.HPHigh,    CFG.HPTextSize,  op * ALPHA_MUL.hpT)
+        s.tracer = NewLine(CFG.TracerCol, CFG.TracerThick, op * ALPHA_MUL.tracer)
+
+        for i = 1, MAX_SKEL do
+            s.sk[i] = NewLine(CFG.SkelCol, CFG.SkelThick, op * SKEL_ALPHA)
+        end
+    end)
+
+    if not ok then
+        DestroySlot(s)
+        error(err)
+    end
+    return s
+end
+
+local function ApplyOpacityAll()
+    local op = CFG.Opacity
+    for _, s in pairs(pool) do
+        for k, m in pairs(ALPHA_MUL) do SetAlpha(s[k], op * m) end
+        for i = 1, MAX_SKEL do SetAlpha(s.sk[i], op * SKEL_ALPHA) end
+    end
+end
+
+-- ═════════════════════════════════════════════════════════
+--  ทะเบียน NPC
+-- ═════════════════════════════════════════════════════════
+local npcSet      = {}
+local playerChars = setmetatable({}, {__mode = "k"})
+
+local function Unregister(m)
+    npcSet[m] = nil
+    local s = pool[m]
+    if s then
+        pool[m] = nil
+        DestroySlot(s)
+    end
+end
+
+local function TrackPlayer(p)
+    if Runtime.PlayerConnections[p] then return end
+
+    local function onChar(c)
+        playerChars[c] = true
+        Unregister(c)
+    end
+
+    if p.Character then onChar(p.Character) end
+    Runtime.PlayerConnections[p] = p.CharacterAdded:Connect(onChar)
+end
+
+local function UntrackPlayer(p)
+    local conn = Runtime.PlayerConnections[p]
+    if conn then pcall(function() conn:Disconnect() end) end
+    Runtime.PlayerConnections[p] = nil
+end
+
+for _, p in ipairs(Players:GetPlayers()) do TrackPlayer(p) end
+Connect(Players.PlayerAdded, TrackPlayer)
+Connect(Players.PlayerRemoving, function(p)
+    UntrackPlayer(p)
+    if p == LocalPlayer and Runtime.Destroy then
+        Runtime.Destroy()
+    end
+end)
+
+local KEY_PARTS = { HumanoidRootPart = true, Torso = true, UpperTorso = true }
+
+local function IsNPCModel(m)
+    if m == workspace or not m:IsA("Model") then return false end
+    if playerChars[m] or Players:GetPlayerFromCharacter(m) then return false end
+    if not (m:FindFirstChildOfClass("Humanoid")
+         or m:FindFirstChild("HumanoidRootPart")
+         or m:FindFirstChild("Torso")
+         or m:FindFirstChild("UpperTorso")) then
+        return false
+    end
+    local f = CFG.Filter
+    if #f == 0 then return true end
+    local low = m.Name:lower()
+    for _, kw in ipairs(f) do
+        if low:find(tostring(kw):lower(), 1, true) then return true end
+    end
+    return false
+end
+
+local function TryRegister(m)
+    if not Runtime.Alive or not m or npcSet[m] then return end
+    if m.Parent and IsNPCModel(m) then
+        npcSet[m] = true
+    end
+end
+
+Connect(workspace.DescendantAdded, function(d)
+    if d:IsA("Model") then
+        TryRegister(d)
+    elseif KEY_PARTS[d.Name] or d:IsA("Humanoid") then
+        TryRegister(d.Parent)
+    end
+end)
+
+Connect(workspace.DescendantRemoving, function(d)
+    if npcSet[d] or pool[d] then Unregister(d) end
+end)
+
+for _, d in ipairs(workspace:GetDescendants()) do
+    if d:IsA("Model") then TryRegister(d) end
+end
+
+local function CleanupPool(now)
+    for model in pairs(npcSet) do
+        if not model.Parent then Unregister(model) end
+    end
+
+    local idleTime = tonumber(CFG.SlotIdleTime) or 30
+    for model, s in pairs(pool) do
+        if now - (s.LastActive or now) > idleTime then
+            pool[model] = nil
+            DestroySlot(s)
+        end
+    end
+end
+
+local function RescanAndCleanup(doScan)
+    if doScan and hasDrawing and CFG.ESP_Enabled then
+        local list = workspace:GetDescendants()
+        for i = 1, #list do
+            if not Runtime.Alive then return end
+            local d = list[i]
+            if d:IsA("Model") then TryRegister(d) end
+            if i % 2000 == 0 then task.wait() end
+        end
+    end
+    CleanupPool(os.clock())
+end
+
+-- ครอบทั้งรอบด้วย pcall: error ครั้งเดียวจะไม่ทำให้งานสแกนหยุดถาวร
+task.spawn(function()
+    while Runtime.Alive do
+        local configured = tonumber(CFG.RescanInterval) or 6
+        local scanEnabled = configured > 0
+        task.wait(scanEnabled and configured or 5)
+
+        if Runtime.Alive then
+            local ok, err = pcall(RescanAndCleanup, scanEnabled)
+            local now = os.clock()
+            if not ok and (Runtime.LastScanWarn == 0 or now - Runtime.LastScanWarn > 5) then
+                Runtime.LastScanWarn = now
+                warn("[ESP] รอบสแกนมีข้อผิดพลาด แต่จะลองใหม่อัตโนมัติ: " .. tostring(err))
+            end
+        end
+    end
+end)
+
+-- ═════════════════════════════════════════════════════════
+--  เรขาคณิต
+-- ═════════════════════════════════════════════════════════
+local BBOX_PARTS = {
+    "Head","Torso","UpperTorso","LowerTorso",
+    "HumanoidRootPart",
+    "Left Arm","Right Arm","Left Leg","Right Leg",
+    "LeftUpperArm","RightUpperArm","LeftLowerArm","RightLowerArm",
+    "LeftUpperLeg","RightUpperLeg","LeftLowerLeg","RightLowerLeg",
+    "LeftFoot","RightFoot","LeftHand","RightHand",
+}
+
+local CORNER_SIGN = {
+    { 1, 1, 1},{-1, 1, 1},{ 1,-1, 1},{-1,-1, 1},
+    { 1, 1,-1},{-1, 1,-1},{ 1,-1,-1},{-1,-1,-1},
+}
+
+local bbMinX, bbMinY, bbMaxX, bbMaxY, bbAny = 0, 0, 0, 0, false
+
+local function ResetBoxBounds()
+    bbMinX, bbMinY = huge, huge
+    bbMaxX, bbMaxY = -huge, -huge
+    bbAny = false
+end
+
+local function AddBoxCorners(cf, size)
+    if not IsFiniteNumber(size.X) or not IsFiniteNumber(size.Y) or not IsFiniteNumber(size.Z) then
+        return
+    end
+
+    local hx, hy, hz = size.X * 0.5, size.Y * 0.5, size.Z * 0.5
+    for c = 1, 8 do
+        local sg = CORNER_SIGN[c]
+        local wp = cf:PointToWorldSpace(v3new(hx * sg[1], hy * sg[2], hz * sg[3]))
+        local sp = Camera:WorldToViewportPoint(wp)
+
+        -- กัน NaN/inf และพิกัดที่เสี่ยงทำให้ Drawing หยุดทำงาน
+        if sp.Z > 0.05 and IsFiniteNumber(sp.X) and IsFiniteNumber(sp.Y) then
+            bbAny = true
+            local sx, sy = sp.X, sp.Y
+            if sx < bbMinX then bbMinX = sx end
+            if sy < bbMinY then bbMinY = sy end
+            if sx > bbMaxX then bbMaxX = sx end
+            if sy > bbMaxY then bbMaxY = sy end
+        end
+    end
+end
+
+local function GetBox2D(model)
+    ResetBoxBounds()
+    local found = 0
+
+    for i = 1, #BBOX_PARTS do
+        local part = model:FindFirstChild(BBOX_PARTS[i])
+        if part and part:IsA("BasePart") then
+            found = found + 1
+            AddBoxCorners(part.CFrame, part.Size)
+        end
+    end
+
+    -- ริกแปลก / มีชิ้นส่วนไม่พอ / คำนวณจากชิ้นส่วนไม่ได้ ให้ลอง bounding box ของทั้งโมเดล
+    if found < 2 or not bbAny then
+        local ok, cf, size = pcall(model.GetBoundingBox, model)
+        if ok and cf and size and (size.X + size.Y + size.Z) > 0 then
+            AddBoxCorners(cf, size)
+        end
+    end
+
+    if not bbAny then return nil end
+    if not (IsFiniteNumber(bbMinX) and IsFiniteNumber(bbMinY)
+        and IsFiniteNumber(bbMaxX) and IsFiniteNumber(bbMaxY)) then
+        return nil
+    end
+
+    -- ไม่ต้องสร้างเส้นสำหรับกรอบที่อยู่นอกจอทั้งหมด
+    local vp = Camera.ViewportSize
+    local margin = 128
+    if bbMaxX < -margin or bbMinX > vp.X + margin
+    or bbMaxY < -margin or bbMinY > vp.Y + margin then
+        return nil
+    end
+
+    -- จำกัดพิกัดสำหรับ NPC ที่เข้ามาใกล้กล้องมาก ไม่ให้ค่าสุดโต่งไปถึง Drawing API
+    local limit = 32767
+    bbMinX = clamp(bbMinX, -limit, limit)
+    bbMinY = clamp(bbMinY, -limit, limit)
+    bbMaxX = clamp(bbMaxX, -limit, limit)
+    bbMaxY = clamp(bbMaxY, -limit, limit)
+
+    if bbMaxX - bbMinX < 2 then
+        bbMinX = bbMinX - 1
+        bbMaxX = bbMaxX + 1
+    end
+    if bbMaxY - bbMinY < 2 then
+        bbMinY = bbMinY - 1
+        bbMaxY = bbMaxY + 1
+    end
+
+    return bbMinX, bbMinY, bbMaxX, bbMaxY
+end
+
+local function AsPart(x)
+    if x and x:IsA("BasePart") then return x end
+    return nil
+end
+
+local function GetAnchorPart(model)
+    return AsPart(model:FindFirstChild("Head"))
+        or AsPart(model:FindFirstChild("HumanoidRootPart"))
+        or AsPart(model:FindFirstChild("UpperTorso"))
+        or AsPart(model:FindFirstChild("Torso"))
+        or AsPart(model.PrimaryPart)
+end
+
+local function GetRootPart(model)
+    local r = AsPart(model:FindFirstChild("HumanoidRootPart"))
+    if r then return r end
+    local hum = model:FindFirstChildOfClass("Humanoid")
+    if hum then r = AsPart(hum.RootPart) end
+    return r
+        or AsPart(model:FindFirstChild("Torso"))
+        or AsPart(model:FindFirstChild("UpperTorso"))
+        or AsPart(model.PrimaryPart)
+        or AsPart(model:FindFirstChild("Head"))
+        or model:FindFirstChildWhichIsA("BasePart", true)
+end
+
+local JOINTS = {
+    {"Head","UpperTorso"},
+    {"UpperTorso","LowerTorso"},
+    {"LowerTorso","HumanoidRootPart"},
+    {"UpperTorso","LeftUpperArm"},
+    {"LeftUpperArm","LeftLowerArm"},
+    {"LeftLowerArm","LeftHand"},
+    {"UpperTorso","RightUpperArm"},
+    {"RightUpperArm","RightLowerArm"},
+    {"RightLowerArm","RightHand"},
+    {"LowerTorso","LeftUpperLeg"},
+    {"LeftUpperLeg","LeftLowerLeg"},
+    {"LeftLowerLeg","LeftFoot"},
+    {"LowerTorso","RightUpperLeg"},
+    {"RightUpperLeg","RightLowerLeg"},
+    {"RightLowerLeg","RightFoot"},
+    {"Head","Torso"},
+    {"Torso","HumanoidRootPart"},
+    {"Torso","Left Arm"},
+    {"Torso","Right Arm"},
+    {"HumanoidRootPart","Left Leg"},
+    {"HumanoidRootPart","Right Leg"},
+}
+
+local linesBuf = {}
+for i = 1, MAX_SKEL do linesBuf[i] = {0,0,0,0} end
+
+local function GetSkelLines(model)
+    local count = 0
+    for _, pair in ipairs(JOINTS) do
+        if count >= MAX_SKEL then break end
+        local pa = model:FindFirstChild(pair[1])
+        local pb = model:FindFirstChild(pair[2])
+        if pa and pb and pa:IsA("BasePart") and pb:IsA("BasePart") then
+            local ax,ay,va,da = W2S(pa.Position)
+            local bx,by,vb,db = W2S(pb.Position)
+            if va and vb and da > 0 and db > 0
+            and IsFiniteNumber(ax) and IsFiniteNumber(ay)
+            and IsFiniteNumber(bx) and IsFiniteNumber(by) then
+                count = count + 1
+                local lb = linesBuf[count]
+                lb[1]=ax; lb[2]=ay; lb[3]=bx; lb[4]=by
+            end
+        end
+    end
+    return count
+end
+
+-- ═════════════════════════════════════════════════════════
+--  วาด ESP
+-- ═════════════════════════════════════════════════════════
+local HEAD_OFFSET = v3new(0, 2.2, 0)
+
+local function DrawModel(model, pPos, maxD2, trX, trY, now)
+    local s    = pool[model]
+    local root = GetRootPart(model)
+
+    if not root then
+        if s then HideSlot(s) end
+        return
+    end
+
+    local dp = root.Position - pPos
+    local d2 = dp.X*dp.X + dp.Y*dp.Y + dp.Z*dp.Z
+    if d2 > maxD2 then
+        if s then HideSlot(s) end
+        return
+    end
+
+    local hum = model:FindFirstChildOfClass("Humanoid")
+    if CFG.HideDead and hum and hum.Health <= 0 then
+        if s then HideSlot(s) end
+        return
+    end
+
+    local dist = sqrt(d2)
+
+    -- คำนวณการมองเห็นก่อนสร้าง Drawing เพื่อไม่สะสม object ของ NPC นอกจอ
+    local x0, y0, x1, y1 = GetBox2D(model)
+    local hasBox = x0 ~= nil
+    if hasBox then
+        x0 = x0 - 2; y0 = y0 - 2
+        x1 = x1 + 2; y1 = y1 + 2
+    end
+
+    local anchor = GetAnchorPart(model) or root
+    local ax, ay, avis, adepth = W2S(anchor.Position + HEAD_OFFSET)
+    local textOk = avis and adepth > 0 and IsFiniteNumber(ax) and IsFiniteNumber(ay)
+    local sx, sy, rootVis, rootDepth = W2S(root.Position)
+    local rootOnScreen = rootVis and rootDepth > 0
+        and IsFiniteNumber(sx) and IsFiniteNumber(sy)
+
+    if not hasBox and not textOk and not rootOnScreen then
+        if s then HideSlot(s) end
+        return
+    end
+
+    if not s then
+        s = CreateSlot()
+        pool[model] = s
+    end
+    s.LastActive = now
+
+    -- กรอบ 2D
+    if CFG.ShowBox and hasBox then
+        s.b1.From = v2new(x0, y0); s.b1.To = v2new(x1, y0); s.b1.Visible = true
+        s.b2.From = v2new(x0, y1); s.b2.To = v2new(x1, y1); s.b2.Visible = true
+        s.b3.From = v2new(x0, y0); s.b3.To = v2new(x0, y1); s.b3.Visible = true
+        s.b4.From = v2new(x1, y0); s.b4.To = v2new(x1, y1); s.b4.Visible = true
+    else
+        s.b1.Visible = false; s.b2.Visible = false
+        s.b3.Visible = false; s.b4.Visible = false
+    end
+
+    local hp, maxHP, pct = GetHealth(model, hum)
+
+    -- แถบ HP และข้อความ HP แยกสวิตช์กัน ปิดแถบแล้วข้อความยังอยู่ได้
+    if CFG.ShowHPBar and hp ~= nil and hasBox then
+        local barW  = 4
+        local barH  = max(2, y1 - y0)
+        local bx    = x0 - barW - 3
+        local fillH = barH * pct
+
+        s.hpBg.Position = v2new(bx, y0)
+        s.hpBg.Size     = v2new(barW, barH)
+        s.hpBg.Visible  = true
+        s.hpFg.Color    = HPColor(pct)
+        s.hpFg.Position = v2new(bx, y1 - fillH)
+        s.hpFg.Size     = v2new(barW, max(1, fillH))
+        s.hpFg.Visible  = fillH > 0.05
+    else
+        s.hpBg.Visible = false
+        s.hpFg.Visible = false
+    end
+
+    -- จัดข้อความเรียงต่อกันอัตโนมัติ ไม่เผื่อช่องว่างจากรายการที่ปิดอยู่
+    local nextY = ay
+    if textOk and CFG.ShowName then
+        s.nameT.Position = v2new(ax, nextY)
+        s.nameT.Text     = model.Name
+        s.nameT.Visible  = true
+        nextY = nextY + CFG.NameSize + 3
+    else
+        s.nameT.Visible = false
+    end
+
+    if textOk and CFG.ShowHPText and hp ~= nil then
+        s.hpT.Position = v2new(ax, nextY)
+        s.hpT.Text     = FormatHPText(hp, maxHP, pct)
+        s.hpT.Color    = HPColor(pct)
+        s.hpT.Visible  = true
+        nextY = nextY + CFG.HPTextSize + 3
+    else
+        s.hpT.Visible = false
+    end
+
+    if textOk and CFG.ShowDist then
+        s.distT.Position = v2new(ax, nextY)
+        s.distT.Text     = fmt("%.0f m", dist)
+        s.distT.Visible  = true
+    else
+        s.distT.Visible = false
+    end
+
+    if CFG.ShowSkeleton then
+        local cnt = GetSkelLines(model)
+        for i = 1, MAX_SKEL do
+            local sk = s.sk[i]
+            if i <= cnt then
+                local lb = linesBuf[i]
+                sk.From    = v2new(lb[1], lb[2])
+                sk.To      = v2new(lb[3], lb[4])
+                sk.Visible = true
+            else
+                sk.Visible = false
+            end
+        end
+    else
+        for i = 1, MAX_SKEL do s.sk[i].Visible = false end
+    end
+
+    if CFG.ShowTracer and rootOnScreen then
+        s.tracer.From    = v2new(trX, trY)
+        s.tracer.To      = v2new(sx, sy)
+        s.tracer.Visible = true
+    else
+        s.tracer.Visible = false
+    end
+end
+
+local failUntil = setmetatable({}, {__mode = "k"})
+local warned    = setmetatable({}, {__mode = "k"})
+
+local function RenderESP()
+    if not hasDrawing then return end
+
+    local cam = workspace.CurrentCamera
+    if not cam then return end
+    Camera = cam
+
+    local vp    = Camera.ViewportSize
+    local trX   = vp.X * 0.5
+    local trY   = vp.Y
+    local pPos  = GetPlayerPos()
+    local maxD2 = CFG.MaxDist * CFG.MaxDist
+    local now   = os.clock()
+
+    for model in pairs(npcSet) do
+        if not model.Parent then
+            Unregister(model)
+        elseif (failUntil[model] or 0) <= now then
+            local ok, err = pcall(DrawModel, model, pPos, maxD2, trX, trY, now)
+            if ok then
+                failUntil[model] = nil
+            else
+                -- ทิ้ง slot ที่อาจเสีย แล้วสร้างใหม่ในรอบถัดไป ไม่ให้ error ถาวรกับ Drawing เดิม
+                failUntil[model] = now + 3
+                local s = pool[model]
+                if s then
+                    pool[model] = nil
+                    pcall(HideSlot, s)
+                    DestroySlot(s)
+                end
+                if not warned[model] then
+                    warned[model] = true
+                    warn("[ESP] " .. tostring(model.Name) .. " : " .. tostring(err))
+                end
+            end
+        end
+    end
+end
+
+-- ═════════════════════════════════════════════════════════
+--  UI helpers / เมนูใหม่
+-- ═════════════════════════════════════════════════════════
+local THEME = {
+    Bg       = Color3.fromRGB(12, 15, 24),
+    Title    = Color3.fromRGB(18, 23, 36),
+    Panel    = Color3.fromRGB(22, 28, 42),
+    Panel2   = Color3.fromRGB(31, 39, 57),
+    Track    = Color3.fromRGB(48, 58, 78),
+    Text     = Color3.fromRGB(235, 239, 248),
+    SubText  = Color3.fromRGB(158, 170, 194),
+    Accent   = Color3.fromRGB(102, 132, 255),
+    On       = Color3.fromRGB(48, 190, 135),
+    Off      = Color3.fromRGB(67, 76, 96),
+    Danger   = Color3.fromRGB(225, 82, 100),
+}
+
+local twInf = TweenInfo.new(0.14, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+
+local function AddCorner(obj, radius)
+    local c = Instance.new("UICorner", obj)
+    c.CornerRadius = UDim.new(0, radius)
+    return c
+end
+
+local function AddStroke(obj, color, transparency)
+    local s = Instance.new("UIStroke", obj)
+    s.Color = color or THEME.Accent
+    s.Transparency = transparency or 0.5
+    s.Thickness = 1
+    return s
+end
+
+local function MakeSlider(parent, labelText, initVal, minVal, maxVal, fmt_fn, onChange)
+    local row = Instance.new("Frame", parent)
+    row.Size             = UDim2.new(1,0,0,56)
+    row.BackgroundColor3 = THEME.Panel
+    row.BorderSizePixel  = 0
+    AddCorner(row, 9)
+
+    local lbl = Instance.new("TextLabel", row)
+    lbl.Size             = UDim2.new(1,-24,0,24)
+    lbl.Position         = UDim2.new(0,12,0,4)
+    lbl.BackgroundTransparency = 1
+    lbl.TextColor3       = THEME.Text
+    lbl.TextSize         = isMobile and 14 or 13
+    lbl.Font             = Enum.Font.Gotham
+    lbl.TextXAlignment   = Enum.TextXAlignment.Left
+    lbl.Text             = labelText .. fmt_fn(initVal)
+
+    local track = Instance.new("Frame", row)
+    track.Size           = UDim2.new(1,-24,0,8)
+    track.Position       = UDim2.new(0,12,1,-18)
+    track.BackgroundColor3 = THEME.Track
+    track.BorderSizePixel  = 0
+    AddCorner(track, 4)
+
+    local rel0 = clamp((initVal - minVal) / (maxVal - minVal), 0, 1)
+    local tfill = Instance.new("Frame", track)
+    tfill.Size           = UDim2.new(rel0,0,1,0)
+    tfill.BackgroundColor3 = THEME.Accent
+    tfill.BorderSizePixel  = 0
+    AddCorner(tfill, 4)
+
+    local knob = Instance.new("Frame", track)
+    knob.Size            = UDim2.new(0,16,0,16)
+    knob.AnchorPoint     = Vector2.new(0.5,0.5)
+    knob.Position        = UDim2.new(rel0,0,0.5,0)
+    knob.BackgroundColor3= THEME.Text
+    knob.BorderSizePixel = 0
+    AddCorner(knob, 8)
+
+    local hit = Instance.new("TextButton", row)
+    hit.Size             = UDim2.new(1,-24,0,32)
+    hit.Position         = UDim2.new(0,12,1,-34)
+    hit.BackgroundTransparency = 1
+    hit.Text             = ""
+    hit.ZIndex           = 10
+
+    local dragging = false
+    local activeInput = nil
+
+    local function update(screenX)
+        local abs = track.AbsolutePosition
+        local sz  = track.AbsoluteSize
+        if sz.X <= 0 then return end
+
+        local r   = clamp((screenX - abs.X) / sz.X, 0, 1)
+        local val = minVal + (maxVal - minVal) * r
+        tfill.Size    = UDim2.new(r,0,1,0)
+        knob.Position = UDim2.new(r,0,0.5,0)
+        lbl.Text      = labelText .. fmt_fn(val)
+        onChange(val)
+    end
+
+    hit.InputBegan:Connect(function(inp)
+        if inp.UserInputType == Enum.UserInputType.MouseButton1
+        or inp.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            activeInput = inp
+            update(inp.Position.X)
+        end
+    end)
+
+    Connect(UserInputService.InputChanged, function(inp)
+        if not dragging then return end
+        if inp.UserInputType == Enum.UserInputType.MouseMovement or inp == activeInput then
+            update(inp.Position.X)
+        end
+    end)
+
+    Connect(UserInputService.InputEnded, function(inp)
+        if inp == activeInput or inp.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging = false
+            activeInput = nil
+        end
+    end)
+
+    return row
+end
+
+local function MakeToggle(parent, label, init, cb)
+    local row = Instance.new("Frame", parent)
+    row.Size             = UDim2.new(1,0,0,42)
+    row.BackgroundColor3 = THEME.Panel
+    row.BorderSizePixel  = 0
+    AddCorner(row, 9)
+
+    local lbl = Instance.new("TextLabel", row)
+    lbl.Size             = UDim2.new(1,-78,1,0)
+    lbl.Position         = UDim2.new(0,12,0,0)
+    lbl.BackgroundTransparency = 1
+    lbl.TextColor3       = THEME.Text
+    lbl.TextSize         = isMobile and 14 or 13
+    lbl.Font             = Enum.Font.Gotham
+    lbl.TextXAlignment   = Enum.TextXAlignment.Left
+    lbl.Text             = label
+
+    local bg = Instance.new("Frame", row)
+    bg.Size              = UDim2.new(0,46,0,24)
+    bg.Position          = UDim2.new(1,-58,0.5,-12)
+    bg.BackgroundColor3  = init and THEME.On or THEME.Off
+    bg.BorderSizePixel   = 0
+    AddCorner(bg, 12)
+
+    local knob = Instance.new("Frame", bg)
+    knob.Size            = UDim2.new(0,20,0,20)
+    knob.Position        = init and UDim2.new(1,-22,0.5,-10) or UDim2.new(0,2,0.5,-10)
+    knob.BackgroundColor3= THEME.Text
+    knob.BorderSizePixel = 0
+    AddCorner(knob, 10)
+
+    local state = init
+    local hit = Instance.new("TextButton", row)
+    hit.Size             = UDim2.new(1,0,1,0)
+    hit.BackgroundTransparency = 1
+    hit.Text             = ""
+    hit.AutoButtonColor  = false
+    hit.MouseButton1Click:Connect(function()
+        state = not state
+        TweenService:Create(knob, twInf, {
+            Position = state and UDim2.new(1,-22,0.5,-10) or UDim2.new(0,2,0.5,-10)
+        }):Play()
+        TweenService:Create(bg, twInf, {
+            BackgroundColor3 = state and THEME.On or THEME.Off
+        }):Play()
+        cb(state)
+    end)
+    return row
+end
+
+local function MakeOption(parent, label, options, initial, cb)
+    local row = Instance.new("Frame", parent)
+    row.Size             = UDim2.new(1,0,0,44)
+    row.BackgroundColor3 = THEME.Panel
+    row.BorderSizePixel  = 0
+    AddCorner(row, 9)
+
+    local buttonWidth = isMobile and 156 or 148
+    local lbl = Instance.new("TextLabel", row)
+    lbl.Size             = UDim2.new(1,-(buttonWidth + 24),1,0)
+    lbl.Position         = UDim2.new(0,12,0,0)
+    lbl.BackgroundTransparency = 1
+    lbl.TextColor3       = THEME.Text
+    lbl.TextSize         = isMobile and 14 or 13
+    lbl.Font             = Enum.Font.Gotham
+    lbl.TextXAlignment   = Enum.TextXAlignment.Left
+    lbl.Text             = label
+
+    local btn = Instance.new("TextButton", row)
+    btn.Size             = UDim2.new(0,buttonWidth,0,30)
+    btn.Position         = UDim2.new(1,-(buttonWidth + 10),0.5,-15)
+    btn.BackgroundColor3 = THEME.Panel2
+    btn.TextColor3       = Color3.fromRGB(190, 205, 255)
+    btn.TextSize         = isMobile and 12 or 11
+    btn.Font             = Enum.Font.GothamBold
+    btn.BorderSizePixel  = 0
+    btn.AutoButtonColor  = false
+    btn.TextTruncate     = Enum.TextTruncate.AtEnd
+    AddCorner(btn, 8)
+    AddStroke(btn, THEME.Accent, 0.72)
+
+    local index = 1
+    for i, option in ipairs(options) do
+        if option[1] == initial then
+            index = i
+            break
+        end
+    end
+    btn.Text = options[index][2] .. "  ›"
+
+    btn.MouseButton1Click:Connect(function()
+        index = index % #options + 1
+        btn.Text = options[index][2] .. "  ›"
+        cb(options[index][1])
+    end)
+    return row
+end
+
+local function SectionLbl(parent, textValue)
+    local f = Instance.new("Frame", parent)
+    f.Size             = UDim2.new(1,0,0,28)
+    f.BackgroundTransparency = 1
+    f.BorderSizePixel  = 0
+
+    local bar = Instance.new("Frame", f)
+    bar.Size = UDim2.new(0,3,0,14)
+    bar.Position = UDim2.new(0,2,0.5,-7)
+    bar.BackgroundColor3 = THEME.Accent
+    bar.BorderSizePixel = 0
+    AddCorner(bar, 2)
+
+    local l = Instance.new("TextLabel", f)
+    l.Size             = UDim2.new(1,-18,1,0)
+    l.Position         = UDim2.new(0,14,0,0)
+    l.BackgroundTransparency = 1
+    l.TextColor3       = THEME.SubText
+    l.TextSize         = 11
+    l.Font             = Enum.Font.GothamBold
+    l.TextXAlignment   = Enum.TextXAlignment.Left
+    l.Text             = textValue
+end
+
+local function MakeHint(parent, value)
+    local f = Instance.new("Frame", parent)
+    f.Size = UDim2.new(1,0,0,48)
+    f.BackgroundColor3 = THEME.Panel
+    f.BackgroundTransparency = 0.25
+    f.BorderSizePixel = 0
+    AddCorner(f, 9)
+
+    local l = Instance.new("TextLabel", f)
+    l.Size = UDim2.new(1,-20,1,-8)
+    l.Position = UDim2.new(0,10,0,4)
+    l.BackgroundTransparency = 1
+    l.TextColor3 = THEME.SubText
+    l.TextSize = isMobile and 12 or 11
+    l.Font = Enum.Font.Gotham
+    l.TextWrapped = true
+    l.TextXAlignment = Enum.TextXAlignment.Left
+    l.TextYAlignment = Enum.TextYAlignment.Center
+    l.Text = value
+end
+
+local function MakeKeybindButton(parent, label, getKey, setKey)
+    local row = Instance.new("Frame", parent)
+    row.Size             = UDim2.new(1,0,0,42)
+    row.BackgroundColor3 = THEME.Panel
+    row.BorderSizePixel  = 0
+    AddCorner(row, 9)
+
+    local lbl = Instance.new("TextLabel", row)
+    lbl.Size             = UDim2.new(1,-112,1,0)
+    lbl.Position         = UDim2.new(0,12,0,0)
+    lbl.BackgroundTransparency = 1
+    lbl.TextColor3       = THEME.Text
+    lbl.TextSize         = isMobile and 14 or 13
+    lbl.Font             = Enum.Font.Gotham
+    lbl.TextXAlignment   = Enum.TextXAlignment.Left
+    lbl.Text             = label
+
+    local btn = Instance.new("TextButton", row)
+    btn.Size             = UDim2.new(0,88,0,28)
+    btn.Position         = UDim2.new(1,-98,0.5,-14)
+    btn.BackgroundColor3 = THEME.Panel2
+    btn.TextColor3       = THEME.Text
+    btn.TextSize         = 12
+    btn.Font             = Enum.Font.GothamBold
+    btn.Text             = getKey().Name
+    btn.BorderSizePixel  = 0
+    btn.AutoButtonColor  = false
+    AddCorner(btn, 8)
+    AddStroke(btn, THEME.Accent, 0.78)
+
+    local listening = false
+    btn.MouseButton1Click:Connect(function()
+        listening = true
+        btn.Text = "..."
+    end)
+
+    Connect(UserInputService.InputBegan, function(inp, gp)
+        if not listening or gp then return end
+        if inp.KeyCode == Enum.KeyCode.Escape then
+            listening = false
+            btn.Text = getKey().Name
+            return
+        end
+        if inp.UserInputType == Enum.UserInputType.Keyboard then
+            setKey(inp.KeyCode)
+            btn.Text = inp.KeyCode.Name
+            listening = false
+        end
+    end)
+end
+
+local function MakeWindowDraggable(window, handle)
+    local dragging = false
+    local dragInput = nil
+    local dragType = nil
+    local dragStart = Vector2.zero
+    local startPos = window.Position
+
+    handle.InputBegan:Connect(function(inp)
+        if inp.UserInputType == Enum.UserInputType.MouseButton1
+        or inp.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragInput = inp
+            dragType = inp.UserInputType
+            dragStart = Vector2.new(inp.Position.X, inp.Position.Y)
+            startPos = window.Position
+        end
+    end)
+
+    Connect(UserInputService.InputChanged, function(inp)
+        if not dragging then return end
+        local valid = inp == dragInput
+            or (dragType == Enum.UserInputType.MouseButton1
+                and inp.UserInputType == Enum.UserInputType.MouseMovement)
+        if not valid then return end
+
+        local delta = Vector2.new(inp.Position.X, inp.Position.Y) - dragStart
+        window.Position = UDim2.new(
+            startPos.X.Scale, startPos.X.Offset + delta.X,
+            startPos.Y.Scale, startPos.Y.Offset + delta.Y
+        )
+    end)
+
+    Connect(UserInputService.InputEnded, function(inp)
+        if inp == dragInput or (dragType == Enum.UserInputType.MouseButton1
+        and inp.UserInputType == Enum.UserInputType.MouseButton1) then
+            dragging = false
+            dragInput = nil
+            dragType = nil
+        end
+    end)
+end
+
+local function BuildGUI()
+    local old = PlayerGui:FindFirstChild("ESP_v3")
+    if old then old:Destroy() end
+
+    local SG = Instance.new("ScreenGui")
+    SG.Name            = "ESP_v3"
+    SG.ResetOnSpawn    = false
+    SG.DisplayOrder    = 20
+    SG.IgnoreGuiInset  = true
+    SG.ZIndexBehavior  = Enum.ZIndexBehavior.Sibling
+    SG.Parent          = PlayerGui
+    Runtime.GUI        = SG
+
+    local fab = isMobile and 58 or 46
+    local QTAB = Instance.new("TextButton", SG)
+    QTAB.Size            = UDim2.new(0,fab,0,fab)
+    QTAB.Position        = UDim2.new(0,12,0,52)
+    QTAB.BackgroundColor3= CFG.ESP_Enabled and THEME.On or THEME.Danger
+    QTAB.TextColor3      = THEME.Text
+    QTAB.TextSize        = isMobile and 12 or 10
+    QTAB.Font            = Enum.Font.GothamBold
+    QTAB.Text            = CFG.ESP_Enabled and "ESP\nON" or "ESP\nOFF"
+    QTAB.BorderSizePixel = 0
+    QTAB.AutoButtonColor = false
+    AddCorner(QTAB, fab / 2)
+    AddStroke(QTAB, THEME.Text, 0.82)
+
+    local FAB = Instance.new("TextButton", SG)
+    FAB.Size             = UDim2.new(0,fab,0,fab)
+    FAB.Position         = UDim2.new(1,-(fab+12),0,52)
+    FAB.BackgroundColor3 = THEME.Accent
+    FAB.TextColor3       = THEME.Text
+    FAB.TextSize         = isMobile and 22 or 18
+    FAB.Font             = Enum.Font.GothamBold
+    FAB.Text             = "☰"
+    FAB.BorderSizePixel  = 0
+    FAB.AutoButtonColor  = false
+    AddCorner(FAB, fab / 2)
+    AddStroke(FAB, THEME.Text, 0.84)
+
+    local vp = Camera.ViewportSize
+    local WW = floor(math.max(260, math.min(isMobile and 350 or 330, vp.X - 24)))
+    local totalH = floor(math.max(280, math.min(vp.Y - 24, clamp(vp.Y - 90, 330, 510))))
+    local TBarH = 46
+
+    local Win = Instance.new("Frame", SG)
+    Win.Name             = "Win"
+    Win.Size             = UDim2.new(0,WW,0,totalH)
+    Win.Position         = UDim2.new(0.5,-WW/2,0.5,-totalH/2)
+    Win.BackgroundColor3 = THEME.Bg
+    Win.BorderSizePixel  = 0
+    Win.Visible          = false
+    Win.Active           = true
+    Win.ClipsDescendants = true
+    AddCorner(Win, 13)
+    AddStroke(Win, THEME.Accent, 0.42)
+
+    local TBar = Instance.new("Frame", Win)
+    TBar.Size            = UDim2.new(1,0,0,TBarH)
+    TBar.BackgroundColor3= THEME.Title
+    TBar.BorderSizePixel = 0
+    TBar.Active          = true
+
+    local accentLine = Instance.new("Frame", TBar)
+    accentLine.Size = UDim2.new(0,4,0,22)
+    accentLine.Position = UDim2.new(0,12,0.5,-11)
+    accentLine.BackgroundColor3 = THEME.Accent
+    accentLine.BorderSizePixel = 0
+    AddCorner(accentLine, 2)
+
+    local TLbl = Instance.new("TextLabel", TBar)
+    TLbl.Size            = UDim2.new(1,-142,1,0)
+    TLbl.Position        = UDim2.new(0,26,0,0)
+    TLbl.BackgroundTransparency = 1
+    TLbl.TextColor3      = THEME.Text
+    TLbl.Font            = Enum.Font.GothamBold
+    TLbl.TextSize        = 14
+    TLbl.Text            = "NPC / BOT ESP"
+    TLbl.TextXAlignment  = Enum.TextXAlignment.Left
+
+    local Version = Instance.new("TextLabel", TBar)
+    Version.Size = UDim2.new(0,42,1,0)
+    Version.Position = UDim2.new(1,-84,0,0)
+    Version.BackgroundTransparency = 1
+    Version.TextColor3 = THEME.SubText
+    Version.Font = Enum.Font.GothamBold
+    Version.TextSize = 11
+    Version.Text = "v3.4"
+
+    local CBtn = Instance.new("TextButton", TBar)
+    CBtn.Size            = UDim2.new(0,28,0,28)
+    CBtn.Position        = UDim2.new(1,-38,0.5,-14)
+    CBtn.BackgroundColor3= THEME.Panel2
+    CBtn.TextColor3      = THEME.SubText
+    CBtn.TextSize        = 18
+    CBtn.Font            = Enum.Font.GothamBold
+    CBtn.Text            = "×"
+    CBtn.BorderSizePixel = 0
+    CBtn.AutoButtonColor = false
+    AddCorner(CBtn, 8)
+
+    local Scroll = Instance.new("ScrollingFrame", Win)
+    Scroll.Size              = UDim2.new(1,0,0,totalH-TBarH)
+    Scroll.Position          = UDim2.new(0,0,0,TBarH)
+    Scroll.BackgroundTransparency = 1
+    Scroll.BorderSizePixel   = 0
+    Scroll.CanvasSize        = UDim2.new(0,0,0,0)
+    Scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    Scroll.ScrollBarThickness = isMobile and 4 or 3
+    Scroll.ScrollBarImageColor3 = THEME.Accent
+    Scroll.ScrollBarImageTransparency = 0.25
+
+    local Ct = Instance.new("Frame", Scroll)
+    Ct.Size              = UDim2.new(1,0,0,0)
+    Ct.AutomaticSize     = Enum.AutomaticSize.Y
+    Ct.BackgroundTransparency = 1
+    Ct.BorderSizePixel   = 0
+    local Lay = Instance.new("UIListLayout", Ct)
+    Lay.Padding          = UDim.new(0,7)
+    Lay.HorizontalAlignment = Enum.HorizontalAlignment.Center
+    local Pad = Instance.new("UIPadding", Ct)
+    Pad.PaddingLeft  = UDim.new(0,10)
+    Pad.PaddingRight = UDim.new(0,10)
+    Pad.PaddingTop   = UDim.new(0,8)
+    Pad.PaddingBottom= UDim.new(0,10)
+
+    SectionLbl(Ct, "การแสดงผล")
+    MakeToggle(Ct,"กรอบ Box 2D",       CFG.ShowBox,      function(v) CFG.ShowBox = v end)
+    MakeToggle(Ct,"ชื่อ NPC",           CFG.ShowName,     function(v) CFG.ShowName = v end)
+    MakeToggle(Ct,"แถบเลือด HP",        CFG.ShowHPBar,    function(v) CFG.ShowHPBar = v end)
+    MakeToggle(Ct,"ข้อความ HP",         CFG.ShowHPText,   function(v) CFG.ShowHPText = v end)
+    MakeOption(Ct, "รูปแบบ HP", {
+        {"Percent", "เปอร์เซ็นต์ (%)"},
+        {"Current", "HP ปัจจุบัน"},
+        {"Number",  "HP / Max HP"},
+        {"Both",    "HP / Max HP + %"},
+    }, CFG.HPTextMode, function(v) CFG.HPTextMode = v end)
+    MakeToggle(Ct,"ระยะห่าง",            CFG.ShowDist,     function(v) CFG.ShowDist = v end)
+    MakeToggle(Ct,"เส้นโครงกระดูก",      CFG.ShowSkeleton, function(v) CFG.ShowSkeleton = v end)
+    MakeToggle(Ct,"เส้น Tracer",         CFG.ShowTracer,   function(v) CFG.ShowTracer = v end)
+    MakeToggle(Ct,"ซ่อน NPC ที่ตายแล้ว", CFG.HideDead,     function(v) CFG.HideDead = v end)
+
+    SectionLbl(Ct, "ภาพและประสิทธิภาพ")
+    MakeSlider(Ct, "ความเข้ม  ", CFG.Opacity, 0.05, 1.0,
+        function(v) return fmt("%.0f%%", v*100) end,
+        function(v)
+            CFG.Opacity = v
+            ApplyOpacityAll()
+        end)
+    MakeSlider(Ct, "ระยะสูงสุด  ", CFG.MaxDist, 50, 1000,
+        function(v) return fmt("%.0f m", v) end,
+        function(v) CFG.MaxDist = floor(v) end)
+    MakeSlider(Ct, "อัตราอัปเดต  ", CFG.UpdateFPS, 15, 60,
+        function(v) return fmt("%d FPS", floor(v + 0.5)) end,
+        function(v) CFG.UpdateFPS = floor(v + 0.5) end)
+
+    SectionLbl(Ct, "ขนาดเส้น")
+    MakeSlider(Ct, "กรอบ Box  ", CFG.BoxThick, 0.5, 4,
+        function(v) return fmt("%.1f", v) end,
+        function(v)
+            CFG.BoxThick = v
+            for _, s in pairs(pool) do
+                for _, k in ipairs({"b1","b2","b3","b4"}) do
+                    if s[k] then s[k].Thickness = v end
+                end
+            end
+        end)
+    MakeSlider(Ct, "โครงกระดูก  ", CFG.SkelThick, 0.5, 3,
+        function(v) return fmt("%.1f", v) end,
+        function(v)
+            CFG.SkelThick = v
+            for _, s in pairs(pool) do
+                for i = 1, MAX_SKEL do
+                    if s.sk[i] then s.sk[i].Thickness = v end
+                end
+            end
+        end)
+    MakeSlider(Ct, "Tracer  ", CFG.TracerThick, 0.5, 3,
+        function(v) return fmt("%.1f", v) end,
+        function(v)
+            CFG.TracerThick = v
+            for _, s in pairs(pool) do
+                if s.tracer then s.tracer.Thickness = v end
+            end
+        end)
+
+    if not isMobile then
+        SectionLbl(Ct, "คีย์ลัด")
+        MakeKeybindButton(Ct, "เปิด / ปิดเมนู",
+            function() return CFG.KeyMenu end,
+            function(k) CFG.KeyMenu = k end)
+        MakeKeybindButton(Ct, "เปิด / ปิด ESP",
+            function() return CFG.KeyToggle end,
+            function(k) CFG.KeyToggle = k end)
+    end
+
+    SectionLbl(Ct, "วิธีใช้")
+    MakeHint(Ct, isMobile
+        and "ปุ่ม ESP: เปิด/ปิดการแสดงผล\nแตะช่องรูปแบบ HP เพื่อเปลี่ยนโหมด ลากแถบหัวเพื่อย้ายเมนู"
+        or  "แตะช่องรูปแบบ HP เพื่อเปลี่ยนโหมด\nลากแถบหัวเพื่อย้ายเมนู · Esc ยกเลิกการตั้งคีย์ลัด")
+
+    local function SetMenuVisible(visible)
+        Win.Visible = visible
+        FAB.Text = visible and "×" or "☰"
+    end
+
+    CBtn.MouseButton1Click:Connect(function() SetMenuVisible(false) end)
+    FAB.MouseButton1Click:Connect(function() SetMenuVisible(not Win.Visible) end)
+    MakeWindowDraggable(Win, TBar)
+
+    local qtTw = TweenInfo.new(0.15, Enum.EasingStyle.Quad)
+    local function ToggleESP()
+        CFG.ESP_Enabled = not CFG.ESP_Enabled
+        local col = CFG.ESP_Enabled and THEME.On or THEME.Danger
+        TweenService:Create(QTAB, qtTw, {BackgroundColor3 = col}):Play()
+        QTAB.Text = CFG.ESP_Enabled and "ESP\nON" or "ESP\nOFF"
+
+        if not CFG.ESP_Enabled then
+            for _, s in pairs(pool) do pcall(HideSlot, s) end
+        end
+    end
+
+    QTAB.MouseButton1Click:Connect(ToggleESP)
+
+    Connect(UserInputService.InputBegan, function(inp, gp)
+        if gp then return end
+        if inp.KeyCode == CFG.KeyMenu then
+            SetMenuVisible(not Win.Visible)
+        elseif inp.KeyCode == CFG.KeyToggle then
+            ToggleESP()
+        end
+    end)
+end
+
+function Runtime.Destroy()
+    if not Runtime.Alive then return end
+    Runtime.Alive = false
+
+    for _, conn in ipairs(Runtime.Connections) do
+        pcall(function() conn:Disconnect() end)
+    end
+    for _, conn in pairs(Runtime.PlayerConnections) do
+        pcall(function() conn:Disconnect() end)
+    end
+    Runtime.PlayerConnections = {}
+
+    for _, s in pairs(pool) do DestroySlot(s) end
+    pool = {}
+    for model in pairs(npcSet) do npcSet[model] = nil end
+
+    if Runtime.GUI then
+        pcall(function() Runtime.GUI:Destroy() end)
+        Runtime.GUI = nil
+    end
+    if Shared[SCRIPT_KEY] == Runtime then
+        Shared[SCRIPT_KEY] = nil
+    end
+end
+
+BuildGUI()
+
+local lastRender = 0
+Connect(RunService.RenderStepped, function()
+    if not Runtime.Alive or not CFG.ESP_Enabled or not hasDrawing then return end
+
+    local now = os.clock()
+    local fps = clamp(tonumber(CFG.UpdateFPS) or 30, 10, 60)
+    if now - lastRender < 1 / fps then return end
+    lastRender = now
+
+    -- กัน error นอก DrawModel ไม่ให้ callback หลุดหรือฟ้องทุกเฟรม
+    local ok, err = pcall(RenderESP)
+    if not ok then
+        lastRender = now + 0.5
+        if Runtime.LastRenderWarn == 0 or now - Runtime.LastRenderWarn > 5 then
+            Runtime.LastRenderWarn = now
+            warn("[ESP] รอบวาดมีข้อผิดพลาด แต่จะลองใหม่อัตโนมัติ: " .. tostring(err))
+        end
+    end
+end)
+
+Connect(LocalPlayer.CharacterAdded, function()
+    -- เก็บ slot ไว้ใช้ต่อได้ ไม่ต้องสร้าง Drawing ใหม่ทั้งหมดทุกครั้งที่เกิด
+    for _, s in pairs(pool) do pcall(HideSlot, s) end
+    lastRender = 0
+end)
+
+warn("[NPC ESP v3.4] ✓ พร้อมใช้งาน — Box / HP 4 รูปแบบ / ระบบกู้ตัวและล้างหน่วยความจำ")
